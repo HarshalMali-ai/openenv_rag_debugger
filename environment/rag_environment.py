@@ -112,13 +112,23 @@ class RAGPipelineEnv:
         if mismatch:
             retrieved = list(reversed(retrieved))[:top_k]
 
+        # Deterministic "reranking": prefer chunks with fewer estimated tokens.
+        # This simulates an LLM-based reranker reducing context flood.
+        if bool(cfg.get("rerank_enabled", False)):
+            retrieved = sorted(retrieved, key=lambda c: (int(c["est_tokens"]), int(c["chunk_index"])))[:top_k]
+
         total_ctx = sum(c["est_tokens"] for c in retrieved)
         max_ctx = int(cfg.get("max_context_tokens", 12000))
         overflow = total_ctx > max_ctx
 
+        retrieved_ids = [f"{c['doc_id']}:{c['chunk_index']}" for c in retrieved]
+        retrieved_fingerprint = "|".join(retrieved_ids)
+
         return {
             "num_chunks_indexed": len(chunks),
             "retrieved_preview": retrieved[:5],
+            "retrieved_preview_ids": retrieved_ids[:5],
+            "retrieved_fingerprint": retrieved_fingerprint,
             "retrieved_count": len(retrieved),
             "embedding_index_mismatch": mismatch,
             "estimated_context_tokens": total_ctx,
@@ -130,6 +140,11 @@ class RAGPipelineEnv:
         if sim is None:
             sim = self._simulate()
         self._config["context_overflow_detected"] = bool(sim["context_overflow_detected"])
+        self._config["embedding_index_mismatch"] = bool(sim["embedding_index_mismatch"])
+        self._config["retrieved_count"] = int(sim["retrieved_count"])
+        self._config["estimated_context_tokens"] = int(sim["estimated_context_tokens"])
+        self._config["retrieved_preview_ids"] = list(sim.get("retrieved_preview_ids", []))
+        self._config["retrieved_fingerprint"] = str(sim.get("retrieved_fingerprint", ""))
 
     def observe(self) -> Observation:
         """Public observation (used by API on validation errors)."""
@@ -195,6 +210,7 @@ class RAGPipelineEnv:
         if a == "request_hint":
             if len(json.dumps(payload)) > 10000:
                 payload = {"truncated": True}
+            self._refresh_sim_into_config()
             reward, br = step_reward(self._task_id, _load_ground(self._task_id), self._config, "request_hint", loop)
             info["breakdown"] = br
 
@@ -212,11 +228,13 @@ class RAGPipelineEnv:
             elif self._task_id == "task_medium":
                 if any(k in payload for k in ("embedding_model", "query_embedding_model")):
                     self._config["reindex_completed"] = False
+            self._refresh_sim_into_config()
             reward, br = step_reward(self._task_id, _load_ground(self._task_id), self._config, "configure", loop)
             info["breakdown"] = br
 
         elif a == "reindex":
             self._config["reindex_completed"] = True
+            self._refresh_sim_into_config()
             reward, br = step_reward(self._task_id, _load_ground(self._task_id), self._config, "configure", loop)
             info["breakdown"] = br
 
